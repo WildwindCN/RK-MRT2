@@ -322,6 +322,8 @@ def main():
     parser.add_argument("--device", type=str, default="cpu",
                         choices=["cpu", "cuda"])
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--weights", type=str, default=None,
+                        help="Path to converted PyTorch weights (.pt)")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -344,6 +346,15 @@ def main():
     ss_cfg = SpectroStreamConfig()
 
     gen = Generator(df_cfg, ss_cfg, device=device)
+
+    # 加载权重
+    if args.weights:
+        print(f"  Loading weights: {args.weights}")
+        state = torch.load(args.weights, map_location=device, weights_only=False)
+        gen.depthformer.load_state_dict(state["depthformer"], strict=False)
+        gen.codec_decoder.load_state_dict(state["codec_decoder"], strict=False)
+        print("  Weights loaded [OK]")
+
     total_params = sum(p.numel() for p in gen.encoder.parameters())
     total_params += sum(p.numel() for p in gen.depthformer.parameters())
     total_params += sum(p.numel() for p in gen.codec_decoder.parameters())

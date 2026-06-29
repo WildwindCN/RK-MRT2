@@ -39,7 +39,7 @@ class TokenEmbedding(nn.Module):
         self.dim = config.temporal_spec.model_dims
 
         # 总词表 = 保留token + 所有层的码本
-        total_embeddings = config.num_reserved_tokens + config.num_codebooks * config.codebook_size
+        total_embeddings = config.vocab_size  # 12294
         self.embed = nn.Embedding(total_embeddings, self.dim)
         self.scale = math.sqrt(self.dim)
 
@@ -263,11 +263,19 @@ class DepthFormer(nn.Module):
         self.temporal_body = TemporalBodyFull(config)
         self.depth_body = DepthBodyAR(config)
 
-    def _pad_sos(self, tokens: torch.Tensor) -> torch.Tensor:
-        """在序列开头插入 SOS token"""
+    def _pad_sos_and_offset(self, tokens: torch.Tensor) -> torch.Tensor:
+        """插入 SOS token 并添加 RVQ 层偏移
+
+        输入: [B, T, Q] per-RVQ 索引 (0..codebook_size-1)
+        输出: [B, T+1, Q] 全词表索引 (含 SOS + RVQ offset)
+        """
         B, T, Q = tokens.shape
-        sos = torch.full((B, 1, Q), self.sos_id, dtype=tokens.dtype, device=tokens.device)
-        return torch.cat([sos, tokens], dim=1)
+        # 添加 RVQ 偏移: token_i_rvq = num_reserved + rvq * codebook_size + local_token
+        offsets = torch.arange(Q, device=tokens.device) * self.config.codebook_size + self.config.num_reserved_tokens
+        full_tokens = tokens + offsets.view(1, 1, -1)
+        # 插入 SOS (token 0)
+        sos = torch.full((B, 1, Q), self.sos_id, dtype=full_tokens.dtype, device=full_tokens.device)
+        return torch.cat([sos, full_tokens], dim=1)
 
     def forward(
         self,
@@ -287,8 +295,8 @@ class DepthFormer(nn.Module):
         """
         B, T, Q = tokens.shape
 
-        # 插入 SOS
-        padded = self._pad_sos(tokens)  # [B, T+1, Q]
+        # 插入 SOS + 添加 RVQ 偏移
+        padded = self._pad_sos_and_offset(tokens)  # [B, T+1, Q], 全词表索引
 
         # Token Embedding
         embedded = self.token_embedding(padded)  # [B, T+1, Q, D_temp]

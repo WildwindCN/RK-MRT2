@@ -138,10 +138,10 @@ class DepthFormerConfig:
 
     @property
     def vocab_size(self) -> int:
-        """多分类输出: 每个 RVQ 层一个 softmax"""
-        return self.codebook_size + self.num_reserved_tokens
+        """展平后的总词表大小 (JAX 原始架构)"""
+        return self.num_codebooks * self.codebook_size + self.num_reserved_tokens
 
     @property
-    def total_vocab_size(self) -> int:
-        """展平后的总词表大小"""
-        return self.num_codebooks * self.codebook_size + self.num_reserved_tokens
+    def per_rvq_vocab_size(self) -> int:
+        """每个 RVQ 层的独立词表大小 (含 reserved tokens)"""
+        return self.codebook_size + self.num_reserved_tokens

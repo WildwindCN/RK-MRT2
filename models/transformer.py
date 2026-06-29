@@ -193,6 +193,7 @@ class CrossAttention(nn.Module):
 
         self.attn_dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
         self.scale = 1.0 / math.sqrt(dim_per_head)
+        self.attention_sink = None  # cross-attn sink supported in checkpoint but not in our arch
 
     def _reshape(self, x: torch.Tensor) -> torch.Tensor:
         B, T, _ = x.shape
