@@ -15,7 +15,8 @@ def test_config():
     assert cfg.temporal_spec.model_dims == 1024
     assert cfg.depth_spec.num_layers == 2
     assert cfg.depth_spec.model_dims == 768
-    assert cfg.vocab_size == 1030  # 1024 + 6
+    assert cfg.vocab_size == 12294  # num_codebooks * codebook_size + num_reserved
+    assert cfg.per_rvq_vocab_size == 1030  # codebook_size + num_reserved
     assert cfg.num_codebooks == 12
     print("  [OK] Config")
 
