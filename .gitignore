@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+exported/
+*.onnx
+*.rknn
+build/
+*.o
+*.a
+*.so
+.vscode/
+.idea/
