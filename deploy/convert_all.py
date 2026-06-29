@@ -39,26 +39,29 @@ GRAPHS = {
         "onnx": "depth_body.onnx",
         "rknn": "depth_body.rknn",
         "description": "Depth Body (2-layer, d=768) — RVQ AR attention",
+        "input_name": "x",
         "input_shape": [1, 12, 1024],
         "output_shape": [1, 12, 12294],
-        "quantize": "fp16",  # fp16 only (precision critical)
+        "quantize": "fp16",
     },
     "codec_decoder": {
         "onnx": "codec_decoder.onnx",
         "rknn": "codec_decoder.rknn",
         "description": "Codec Decoder (7-stage ConvTranspose) — STFT output",
+        "input_name": "embeddings",
         "input_shape": [1, 25, 256],
         "output_shape": [1, 4, 480, 100],
-        "quantize": "int8",  # can use int8 (conv-only, robust to quantization)
+        "quantize": "fp16",
     },
     "temporal_body": {
         "onnx": "temporal_body.onnx",
         "rknn": "temporal_body.rknn",
         "description": "Temporal Body (12-layer, d=1024) — stateful KV cache",
-        "input_shape": "dynamic",  # 26 inputs with variable KV lengths
-        "output_shape": "dynamic",
+        "input_name": "x",
+        "input_shape": [1, 1, 1024],
+        "output_shape": [1, 1, 1024],
         "quantize": "fp16",
-        "note": "731MB FP32 → ~365MB FP16. 最大 KV length=512",
+        "note": "731MB FP32 → ~365MB FP16. Stateful graph, 26 inputs with KV caches.",
     },
 }
 
@@ -119,15 +122,21 @@ def convert_graph(name, info, onnx_dir, output_dir, precision):
     rknn = RKNN(verbose=True)
 
     # 配置
+    float_dtype = "float16" if quant == "fp16" else "float32"
     rknn.config(
         target_platform=RKNN_CONFIG["target_platform"],
         optimization_level=RKNN_CONFIG["optimization_level"],
-        output_tensor_type=quant if quant in ("fp16", "int8") else "float16",
+        float_dtype=float_dtype,
     )
 
-    # 加载 ONNX
-    print(f"  Loading ONNX: {onnx_path}")
-    ret = rknn.load_onnx(model=onnx_path)
+    # 加载 ONNX (固定 batch, 指定输入名)
+    input_name = info.get("input_name", "x")
+    print(f"  Loading ONNX: {onnx_path} (input: {input_name}, shape: {info['input_shape']})")
+    ret = rknn.load_onnx(
+        model=onnx_path,
+        inputs=[input_name],
+        input_size_list=[info["input_shape"]],
+    )
     if ret != 0:
         raise RuntimeError(f"load_onnx failed: {ret}")
 
