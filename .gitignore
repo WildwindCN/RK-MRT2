@@ -15,3 +15,4 @@ demo_output.wav
 verify_e2e.wav
 verify_weights.pt
 verify_*.onnx
+rknn_models/
