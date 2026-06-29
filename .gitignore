@@ -10,3 +10,4 @@ build/
 *.so
 .vscode/
 .idea/
+demo_output.wav
