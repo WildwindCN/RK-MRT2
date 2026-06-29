@@ -32,20 +32,14 @@ import numpy as np
 import torch
 import safetensors
 
-# safetensors.flax 需要 JAX, 用普通 safetensors 替代
-try:
-    import safetensors.flax as safetensors_flax
-    def _load_safetensors(path):
-        flat = safetensors_flax.load_file(path)
-        return {k: v for k, v in flat.items()}
-except ImportError:
-    def _load_safetensors(path):
-        """用普通 safetensors 加载 (无需 JAX)"""
-        flat = {}
-        with safetensors.safe_open(path, framework="np") as f:
-            for key in f.keys():
-                flat[key] = f.get_tensor(key)
-        return flat
+# 统一使用普通 safetensors 加载 (避免 JAX 依赖)
+def _load_safetensors(path):
+    """用普通 safetensors 加载 (返回 numpy arrays, 无需 JAX)"""
+    flat = {}
+    with safetensors.safe_open(path, framework="np") as f:
+        for key in f.keys():
+            flat[key] = f.get_tensor(key)
+    return flat
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
