@@ -47,8 +47,10 @@ def cleanup_ddp():
 def load_checkpoint_state(path, cfg, encoder, decoder):
     """从 MRT2 Small checkpoint 加载 RVQ + Decoder 初始化权重
 
-    Decoder 架构已对齐 JAX, 可直接加载。Encoder 不加载 (从头训练)。
-    RVQ 加载后冻结。
+    旧 checkpoint 键名映射到新架构:
+      stages.X → pre_split_stages.X 或 post_split_stages.X
+      (根据 channel_splits 配置自动分配)
+    Encoder 不加载 (从头训练), RVQ 加载后冻结。
     """
     state = torch.load(path, map_location='cpu', weights_only=True)
     codec_state = state['codec_decoder']
@@ -64,75 +66,89 @@ def load_checkpoint_state(path, cfg, encoder, decoder):
     else:
         raise RuntimeError(f"Unexpected RVQ shape: {rvq_weight.shape}")
 
-    # Load Decoder (partial — only matching keys)
+    # Remap old stage keys to new split architecture
+    # Old: stages.0.* → New: pre_split_stages.0.* (first split_after stages)
+    # Old: stages.1..6.* → New: post_split_stages.0..5.* (remaining stages)
+    num_blocks = len(cfg.ratios)
+    channel_recombo = (num_blocks + 1) + cfg.channel_recombo_block  # -2 → 6
+    split_after = num_blocks - channel_recombo  # 7 - 6 = 1
+
     decoder_state = {}
     for k, v in codec_state.items():
         if k.startswith('rvq_embedding.'):
             continue
-        if hasattr(decoder, k.split('.')[0]) or any(
-            k.startswith(p) for p in ['input_conv', 'input_shortcut',
-                                       'input_residual', 'stages', 'output_']
-        ):
+        # Remap stages.N.* to pre_split_stages.N.* or post_split_stages.(N-split_after).*
+        if k.startswith('stages.'):
+            parts = k.split('.', 2)  # ['stages', 'N', 'rest']
+            idx = int(parts[1])
+            if idx < split_after:
+                new_k = f"pre_split_stages.{idx}.{parts[2]}"
+            else:
+                new_k = f"post_split_stages.{idx - split_after}.{parts[2]}"
+            decoder_state[new_k] = v
+        else:
             decoder_state[k] = v
+
     missing, unexpected = decoder.load_state_dict(decoder_state, strict=False)
-    print(f"  Decoder: {len(decoder_state)} params loaded, "
-          f"{len(missing)} missing (untrained), {len(unexpected)} unexpected")
+    loaded_pct = len(decoder_state) - len(missing)
+    total_p = len(decoder_state)
+    print(f"  Decoder: {loaded_pct}/{total_p} params loaded "
+          f"({100*loaded_pct/max(1,total_p):.0f}%), "
+          f"{len(missing)} missing, {len(unexpected)} unexpected")
     if missing:
         print(f"    First 5 missing: {missing[:5]}")
+    if unexpected:
+        print(f"    First 5 unexpected: {unexpected[:5]}")
 
     return rvq
 
 
 def compute_stft(waveform, cfg):
-    """在线计算 STFT 特征 [B, C_audio, N] → [B, 4, 480, T_stft]
+    """在线计算 STFT [B, C, N] → [B, 4, 480, T_stft]
 
-    严格对齐 JAX slice_and_bitcast:
-      complex STFT [B, T, 481, C_audio] → view_as_real → [B, T, 481, 2*C_audio]
-      → drop Nyquist → [B, T, 480, 4]
-    输出格式: [B, 4, 480, T_stft] (BCFT)
+    强制 float32 计算 (STFT 在 bf16 autocast 下不兼容)。
     """
-    window = torch.hann_window(cfg.stft_fft_length, periodic=True,
-                               device=waveform.device)
-    B, C_audio, N = waveform.shape
+    # Force float32 for STFT (incompatible with bf16 autocast)
+    wf = waveform.float()
+    window = torch.hann_window(cfg.stft_fft_length, periodic=True, device=wf.device)
+    B, C_audio, N = wf.shape
 
     stfts = []
     for ch in range(C_audio):
-        stft = torch.stft(
-            waveform[:, ch],
-            n_fft=cfg.stft_fft_length,
-            hop_length=cfg.stft_frame_step,
-            win_length=cfg.stft_frame_length,
-            window=window,
-            center=True,
-            return_complex=True,
-        )  # [B, 481, T_stft] complex
-        real_imag = torch.view_as_real(stft)  # [B, 481, T_stft, 2]
+        stft = torch.stft(wf[:, ch], n_fft=cfg.stft_fft_length,
+                          hop_length=cfg.stft_frame_step,
+                          win_length=cfg.stft_frame_length,
+                          window=window, center=True, return_complex=True)
+        real_imag = torch.view_as_real(stft)  # [B, 481, T, 2]
         stfts.append(real_imag)
 
-    # JAX: view(float_dtype) → [B, T_stft, 481, 2*C_audio]
-    # PyTorch: stack channels, permute to BCFT
-    # [B, 481, T, 2] x 2 → stack → [B, 2, 481, T, 2] → permute → [B, 2, 2, 481, T] → reshape → [B, 4, 481, T]
     stft_in = torch.stack(stfts, dim=1)  # [B, C_audio, 481, T, 2]
     stft_in = stft_in.permute(0, 1, 4, 2, 3)  # [B, C_audio, 2, 481, T]
-    stft_in = stft_in.reshape(B, C_audio * 2, cfg.stft_fft_length // 2 + 1, -1)  # [B, 4, 481, T]
-    # Drop Nyquist bin (keep_dc=True): keep first 480 of 481 freq bins
-    stft_in = stft_in[:, :, :cfg.num_bins, :]  # [B, 4, 480, T_stft]
+    stft_in = stft_in.reshape(B, C_audio * 2, cfg.stft_fft_length // 2 + 1, -1)
+    stft_in = stft_in[:, :, :cfg.num_bins, :]  # [B, 4, 480, T]
     return stft_in
+
+
+# Global ISTFTLayer (created once, not per-step)
+_istft_layer = None
 
 
 def compute_istft(stft_features, cfg):
     """逆 STFT: [B, 4, 480, T] → [B, 2, N_samples]
 
-    使用 ISTFTLayer 进行确定性重建。
+    强制 float32 计算, 全局单例避免重复分配。
     """
-    istft = ISTFTLayer(
-        frame_length=cfg.stft_frame_length,
-        frame_step=cfg.stft_frame_step,
-        fft_length=cfg.stft_fft_length,
-        num_bins=cfg.num_bins,
-        num_channels=cfg.num_channels,
-    ).to(stft_features.device)
-    return istft(stft_features)
+    global _istft_layer
+    if _istft_layer is None or _istft_layer.window.device != stft_features.device:
+        _istft_layer = ISTFTLayer(
+            frame_length=cfg.stft_frame_length,
+            frame_step=cfg.stft_frame_step,
+            fft_length=cfg.stft_fft_length,
+            num_bins=cfg.num_bins,
+            num_channels=cfg.num_channels,
+        ).to(stft_features.device)
+    # Force float32 for iSTFT (incompatible with bf16 autocast)
+    return _istft_layer(stft_features.float())
 
 
 def rvq_encode(embeddings, rvq, cfg):
@@ -244,8 +260,14 @@ def train():
               f"(frozen in Phase 1)")
         print(f"  Trainable: {sum(p.numel() for p in trainable_params)/1e6:.1f}M")
 
+    # Wrap in DDP for gradient sync across GPUs
+    if world_size > 1:
+        encoder = DDP(encoder, device_ids=[local_rank], output_device=local_rank)
+        # Decoder is frozen in Phase 1, will be re-wrapped in Phase 2
+
     # Optimizer
-    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr,
+    base_lr = args.lr
+    optimizer = torch.optim.AdamW(trainable_params, lr=base_lr,
                                    betas=(0.8, 0.99), weight_decay=1e-5)
 
     # Data
@@ -276,17 +298,25 @@ def train():
         epoch_stft = 0.0
         epoch_commit = 0.0
 
-        # Phase 2: unfreeze decoder
+        # Phase 2: unfreeze decoder, wrap in DDP, reset optimizer
         if epoch == args.phase1_epochs + 1:
+            # Unwrap encoder from DDP to get raw modules for parameter collection
+            encoder_raw = encoder.module if world_size > 1 else encoder
             for p in decoder.parameters():
                 p.requires_grad = True
-            trainable_params = list(encoder.parameters()) + list(decoder.parameters())
-            optimizer = torch.optim.AdamW(trainable_params, lr=args.lr * 0.5,
+            trainable_params = (list(encoder_raw.parameters()) +
+                               list(decoder.parameters()))
+            base_lr = args.lr * 0.5  # Reduce LR for joint fine-tuning
+            optimizer = torch.optim.AdamW(trainable_params, lr=base_lr,
                                            betas=(0.8, 0.99), weight_decay=1e-5)
+            # Wrap decoder in DDP now that it's trainable
+            if world_size > 1:
+                decoder = DDP(decoder, device_ids=[local_rank],
+                              output_device=local_rank)
             if is_main:
                 dec_trainable = sum(p.numel() for p in decoder.parameters())
                 print(f"\n  Phase 2: Decoder unfrozen ({dec_trainable/1e6:.1f}M "
-                      f"params), LR reduced to {args.lr * 0.5}")
+                      f"params), LR={base_lr}")
 
         for batch_idx, waveform in enumerate(loader):
             global_step += 1
@@ -299,7 +329,7 @@ def train():
                 progress = (global_step - warmup_steps) / (total_steps - warmup_steps)
                 lr_scale = 0.5 * (1 + math.cos(math.pi * progress))
             for pg in optimizer.param_groups:
-                pg['lr'] = args.lr * lr_scale
+                pg['lr'] = base_lr * lr_scale
 
             with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=use_amp):
                 # STFT
@@ -380,9 +410,10 @@ def train():
         final_path = os.path.join(args.output_dir, 'codec_final.pt')
         torch.save({
             'epoch': args.epochs,
-            'encoder': encoder.state_dict(),
-            'decoder': decoder.state_dict(),
+            'encoder': (encoder.module if world_size > 1 else encoder).state_dict(),
+            'decoder': (decoder.module if world_size > 1 else decoder).state_dict(),
             'rvq': rvq.state_dict(),
+            'optimizer': optimizer.state_dict(),
             'cfg': cfg,
         }, final_path)
         print(f"\n  Final checkpoint: {final_path}")
