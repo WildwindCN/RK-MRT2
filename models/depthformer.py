@@ -91,12 +91,14 @@ class TemporalBodyStateful(nn.Module):
         x: torch.Tensor,
         conditioning: torch.Tensor,
         kv_caches: list[dict] | None = None,
+        attention_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, list[dict]]:
         """
         Args:
             x: [B, 1, D] 当前帧输入
             conditioning: [B, T_cond, D] MIDI encoder 输出
             kv_caches: 可选, 每层的 KV cache dict
+            attention_mask: [B, 1, 1, K_total] 外部 attention mask (含 sink + window + padding)
 
         Returns:
             output: [B, 1, D]
@@ -113,6 +115,7 @@ class TemporalBodyStateful(nn.Module):
                 conditioning=conditioning,
                 self_kv_cache=cache.get("self_kv"),
                 cross_kv_cache=cache.get("cross_kv"),
+                attention_mask=attention_mask,
             )
             new_kv_caches.append({
                 "self_kv": new_self_kv,

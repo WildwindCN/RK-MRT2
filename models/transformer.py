@@ -143,15 +143,20 @@ class SlidingWindowAttention(nn.Module):
             attn_weights = attn_weights + attention_mask
 
         # 滑动窗口: 屏蔽超出 max_past_horizon 的过去位置
-        K = k.shape[2]
-        if self.max_past_horizon > 0 and T == 1:
-            # 单帧推理: 保留最近的 max_past_horizon 帧
-            causal_mask = torch.ones(1, 1, 1, K, device=x.device, dtype=attn_weights.dtype)
-            if K > self.max_past_horizon + self.num_sink_embeddings:
-                # 屏蔽最老的帧, 保留 sink + 最近 max_past_horizon
-                old_len = K - self.max_past_horizon - self.num_sink_embeddings
-                causal_mask[:, :, :, self.num_sink_embeddings:self.num_sink_embeddings + old_len] = float("-inf")
-            attn_weights = attn_weights + causal_mask
+        # 如果外部提供了 attention_mask, 跳过内部 mask 构建 (用于静态 ONNX 导出)
+        if attention_mask is not None:
+            # 外部 mask 已包含滑动窗口 + padding 逻辑, 直接使用
+            attn_weights = attn_weights + attention_mask
+        else:
+            K = k.shape[2]
+            if self.max_past_horizon > 0 and T == 1:
+                # 单帧推理: 保留最近的 max_past_horizon 帧
+                causal_mask = torch.ones(1, 1, 1, K, device=x.device, dtype=attn_weights.dtype)
+                if K > self.max_past_horizon + self.num_sink_embeddings:
+                    # 屏蔽最老的帧, 保留 sink + 最近 max_past_horizon
+                    old_len = K - self.max_past_horizon - self.num_sink_embeddings
+                    causal_mask[:, :, :, self.num_sink_embeddings:self.num_sink_embeddings + old_len] = float("-inf")
+                attn_weights = attn_weights + causal_mask
 
         attn_weights = F.softmax(attn_weights, dim=-1)
         attn_weights = self.attn_dropout(attn_weights)

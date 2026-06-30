@@ -54,19 +54,28 @@ GRAPHS = {
         "quantize": "fp16",
     },
     "temporal_body": {
-        "onnx": "temporal_body.onnx",
+        "onnx": "temporal_body_sim.onnx",
         "rknn": "temporal_body.rknn",
-        "description": "Temporal Body (12-layer, d=1024) — stateful KV cache",
-        "input_name": "x",
-        "input_shape": [1, 1, 1024],
+        "description": "Temporal Body (12-layer, d=1024) — stateful KV cache + attn mask",
+        "input_name": "x",  # primary input name (legacy, not used for multi-input)
+        "input_shape": [1, 1, 1024],  # x shape only
         "output_shape": [1, 1, 1024],
         "quantize": "fp16",
-        "note": "731MB FP32 → ~365MB FP16. Stateful graph, 26 inputs with KV caches.",
+        "note": "27 inputs: x + cond + attn_mask + 24 KV caches. Fixed 42-pos KV + 44-pos mask.",
+        # Multi-input specification
+        "multi_input": True,
+        "all_inputs": [
+            # name, shape
+            ("x", [1, 1, 1024]),
+            ("cond", [1, 50, 256]),
+            ("attn_mask", [1, 1, 1, 44]),
+        ] + [(f"self_k_{i}", [1, 8, 42, 128]) for i in range(12)] \
+          + [(f"self_v_{i}", [1, 8, 42, 128]) for i in range(12)],
     },
 }
 
 RKNN_CONFIG = {
-    "target_platform": "rk3588",
+    "target_platform": "rk3576",
     "optimization_level": 3,
 }
 
@@ -103,7 +112,7 @@ def check_environment():
 
 
 def convert_graph(name, info, onnx_dir, output_dir, precision):
-    """转换单个 graph"""
+    """转换单个 graph (支持单输入和多输入)"""
     from rknn.api import RKNN
 
     onnx_path = os.path.join(onnx_dir, info["onnx"])
@@ -113,10 +122,20 @@ def convert_graph(name, info, onnx_dir, output_dir, precision):
     quant = precision or info.get("quantize", "fp16")
     do_quant = quant == "int8"
 
+    # 多输入 vs 单输入
+    is_multi = info.get("multi_input", False)
+    if is_multi:
+        input_names = [item[0] for item in info["all_inputs"]]
+        input_size_list = [item[1] for item in info["all_inputs"]]
+    else:
+        input_names = [info["input_name"]]
+        input_size_list = [info["input_shape"]]
+
     print(f"\n{'='*60}")
     print(f"Converting: {name}")
     print(f"  {info['description']}")
     print(f"  Precision: {quant}")
+    print(f"  Inputs: {len(input_names)} ({', '.join(input_names[:5])}{'...' if len(input_names) > 5 else ''})")
     print(f"{'='*60}")
 
     rknn = RKNN(verbose=True)
@@ -129,13 +148,12 @@ def convert_graph(name, info, onnx_dir, output_dir, precision):
         float_dtype=float_dtype,
     )
 
-    # 加载 ONNX (固定 batch, 指定输入名)
-    input_name = info.get("input_name", "x")
-    print(f"  Loading ONNX: {onnx_path} (input: {input_name}, shape: {info['input_shape']})")
+    # 加载 ONNX
+    print(f"  Loading ONNX: {onnx_path}")
     ret = rknn.load_onnx(
         model=onnx_path,
-        inputs=[input_name],
-        input_size_list=[info["input_shape"]],
+        inputs=input_names,
+        input_size_list=input_size_list,
     )
     if ret != 0:
         raise RuntimeError(f"load_onnx failed: {ret}")
@@ -162,7 +180,7 @@ def convert_graph(name, info, onnx_dir, output_dir, precision):
 
 
 def verify_graph(name, info, rknn_path):
-    """验证 RKNN 输出精度"""
+    """验证 RKNN 输出精度 (支持多输入)"""
     from rknn.api import RKNN
 
     print(f"\n  Verifying {name}...")
@@ -171,8 +189,17 @@ def verify_graph(name, info, rknn_path):
     rknn.load_rknn(rknn_path)
     rknn.init_runtime(target=RKNN_CONFIG["target_platform"])
 
-    # 生成测试输入
-    if isinstance(info["input_shape"], list):
+    is_multi = info.get("multi_input", False)
+    if is_multi:
+        inputs = []
+        for item in info["all_inputs"]:
+            inputs.append(np.random.randn(*item[1]).astype(np.float32))
+        rknn_out = rknn.inference(inputs=inputs)
+        print(f"    Inputs: {len(inputs)}, Outputs: {len(rknn_out)}")
+        print(f"    Output[0] shape: {list(rknn_out[0].shape)}, no NaN: {not np.isnan(rknn_out[0]).any()}")
+        for i in range(1, min(4, len(rknn_out))):
+            print(f"    Output[{i}] shape: {list(rknn_out[i].shape)}, no NaN: {not np.isnan(rknn_out[i]).any()}")
+    else:
         x = np.random.randn(*info["input_shape"]).astype(np.float32)
         rknn_out = rknn.inference(inputs=[x])
         print(f"    Input: {info['input_shape']}, Output: {list(rknn_out[0].shape)}")
@@ -230,16 +257,16 @@ echo "Run: ./rk_mrt2_demo --temporal temporal_body.rknn --depth depth_body.rknn 
     # 创建 README
     readme = os.path.join(pkg_dir, "README.txt")
     with open(readme, "w") as f:
-        f.write("""RK-MRT2 Board Deployment Package
-=================================
+        f.write("""RK-MRT2 Board Deployment Package (RK3576)
+============================================
 
 Models:
   - depth_body.rknn      Depth Body (FP16, ~32MB)
-  - codec_decoder.rknn   Codec Decoder (FP16/INT8, ~30MB)
-  - temporal_body.rknn   Temporal Body (FP16, ~365MB)
+  - codec_decoder.rknn   Codec Decoder (FP16, ~30MB)
+  - temporal_body.rknn   Temporal Body (FP16, ~350MB)
 
 Board Requirements:
-  - RK3588 with NPU driver (rknpu2)
+  - RK3576 with NPU driver (rknpu2)
   - librknnrt.so in library path
   - 2+ GB free RAM for Temporal Body
 
@@ -250,11 +277,11 @@ Quick Test:
             --depth depth_body.rknn --codec codec_decoder.rknn \\
             --output test.wav
 
-Expected Performance (RK3588):
-  - Temporal Body: < 5ms/frame
+Expected Performance (RK3576):
+  - Temporal Body: < 10ms/frame
   - Depth Body: < 10ms/frame
-  - Codec Decoder: < 3ms/frame
-  - Total: < 20ms/frame (40ms budget, 2x headroom)
+  - Codec Decoder: < 5ms/frame
+  - Total: < 30ms/frame (40ms budget)
 """)
     print(f"  Created: README.txt")
     print(f"\nDeployment package: {pkg_dir}")
@@ -276,7 +303,7 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     print("=" * 60)
-    print("RK-MRT2: RK3588 Board Deployment Pipeline")
+    print("RK-MRT2: RK3576 Board Deployment Pipeline")
     print("=" * 60)
 
     # 1. 环境检查

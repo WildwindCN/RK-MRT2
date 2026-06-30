@@ -5,24 +5,25 @@
  *
  * 推理循环 (每 40ms 一帧 @ 25Hz):
  *   1. 更新 MIDI conditioning
- *   2. 单帧 Temporal Body (NPU, stateful)
+ *   2. 单帧 Temporal Body (NPU, stateful, 27 inputs)
  *   3. Depth Body AR (NPU/CPU, 12 步 cascade)
  *   4. CPU 采样 (top-k, temperature)
  *   5. Codec Decoder (NPU) + iSTFT (CPU)
  *   6. 输出 PCM 音频
  *
- * 延迟预算:
- *   - Temporal Body: < 5ms (NPU FP16)
+ * 延迟预算 (RK3576):
+ *   - Temporal Body: < 10ms (NPU FP16)
  *   - Depth Body: < 10ms (12 steps × ~0.8ms)
  *   - Codec Decoder + iSTFT: < 5ms
- *   - 总计: < 20ms (40ms 预算, 安全余量 2x)
+ *   - 总计: < 30ms (40ms 预算)
  *
  * 内存预算 (估算):
- *   - Temporal Body: ~360MB (FP16 weights + KV cache)
+ *   - Temporal Body: ~362MB (FP16 weights + NPU internal)
  *   - Depth Body: ~32MB (FP16 weights)
- *   - Codec Decoder: ~61MB (FP16 weights)
+ *   - Codec Decoder: ~30MB (FP16 weights)
+ *   - KV Cache ring buffer: ~25MB (CPU)
  *   - Audio buffers: ~1MB
- *   - 总计: ~460MB (RK3588 通常有 4-8GB RAM)
+ *   - 总计: ~450MB (RK3576 通常有 2-8GB RAM)
  */
 
 #pragma once
@@ -50,7 +51,8 @@ struct ModelConfig {
     int temporal_layers = 12;
     int temporal_heads = 8;
     int temporal_dim_per_head = 128;
-    int temporal_max_kv_len = 512;
+    int temporal_window_size = 42;   // NPU window (41 window + 1 sink)
+    int temporal_ring_capacity = 512; // CPU ring buffer capacity
 
     // Depth Body
     int depth_dim = 768;
@@ -186,6 +188,7 @@ private:
     AudioCallback audio_cb_;
 
     bool initialized_ = false;
+    int current_frame_ = 0;
 };
 
 // ═══════════════════════════════════════════════════════
@@ -205,8 +208,9 @@ inline InferenceEngine::InferenceEngine(
 
     kv_config_.num_layers = cfg.temporal_layers;
     kv_config_.num_heads = cfg.temporal_heads;
-    kv_config_.max_kv_len = cfg.temporal_max_kv_len;
     kv_config_.dim_per_head = cfg.temporal_dim_per_head;
+    kv_config_.ring_capacity = cfg.temporal_ring_capacity;
+    kv_config_.window_size = cfg.temporal_window_size;
 
     sampler_ = std::make_unique<TokenSampler>(
         cfg.vocab_size, cfg.codebook_size);
@@ -262,25 +266,57 @@ inline int InferenceEngine::generate_frame(float* pcm_output) {
 }
 
 inline int InferenceEngine::step_temporal_body() {
-    // 构建输入: [temporal_input, cond, self_k_0, self_v_0, ..., self_k_11, self_v_11]
+    // 准备当前帧: 提取 window + 更新 attention mask
+    kv_cache_->prepare_frame(current_frame_);
+
+    // 构建 27 个输入:
+    //   [0] x (temporal_input)
+    //   [1] cond (conditioning)
+    //   [2] attn_mask (precomputed by KVCacheManager)
+    //   [3..26] self_k_0..11, self_v_0..11 (window buffers)
     std::vector<float*> inputs;
     inputs.push_back(temporal_input_.data());
     inputs.push_back(conditioning_.data());
+    inputs.push_back(const_cast<float*>(kv_cache_->mask().data()));
 
     for (int i = 0; i < cfg_.temporal_layers; i++) {
-        inputs.push_back((float*)kv_cache_->layer(i).self_k_data());
-        inputs.push_back((float*)kv_cache_->layer(i).self_v_data());
+        inputs.push_back(const_cast<float*>(
+            static_cast<const float*>(kv_cache_->layer(i).window_k())));
+        inputs.push_back(const_cast<float*>(
+            static_cast<const float*>(kv_cache_->layer(i).window_v())));
     }
 
-    // 构建输出 (指向预分配 buffer)
+    // 构建 25 个输出 (指向预分配 buffer)
     std::vector<float*> outputs;
     outputs.push_back(temporal_output_.data());
+
+    // KV cache 输出是 window-sized buffers (需要临时存储)
+    static thread_local std::vector<std::vector<uint8_t>> kv_out_buffers;
+    if (kv_out_buffers.size() != cfg_.temporal_layers * 2) {
+        kv_out_buffers.resize(cfg_.temporal_layers * 2);
+        for (int i = 0; i < cfg_.temporal_layers; i++) {
+            kv_out_buffers[i * 2].resize(
+                kv_cache_->layer(i).window_bytes());
+            kv_out_buffers[i * 2 + 1].resize(
+                kv_cache_->layer(i).window_bytes());
+        }
+    }
     for (int i = 0; i < cfg_.temporal_layers; i++) {
-        outputs.push_back((float*)kv_cache_->layer(i).self_k_data());
-        outputs.push_back((float*)kv_cache_->layer(i).self_v_data());
+        outputs.push_back(reinterpret_cast<float*>(kv_out_buffers[i * 2].data()));
+        outputs.push_back(reinterpret_cast<float*>(kv_out_buffers[i * 2 + 1].data()));
     }
 
-    return temporal_model_->run(inputs, outputs);
+    int ret = temporal_model_->run(inputs, outputs);
+
+    // 合并: 从 NPU 输出提取最新 K/V 写回 ring buffer
+    for (int i = 0; i < cfg_.temporal_layers; i++) {
+        kv_cache_->merge_frame(i,
+            kv_out_buffers[i * 2].data(),
+            kv_out_buffers[i * 2 + 1].data());
+    }
+
+    current_frame_++;
+    return ret;
 }
 
 inline int InferenceEngine::step_depth_body_ar() {

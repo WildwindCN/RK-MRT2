@@ -1,6 +1,6 @@
 """RKNN 转换配置
 
-每个 graph 的 RKNN 编译参数, 针对 RK3588 NPU 优化。
+每个 graph 的 RKNN 编译参数, 针对 RK3576 NPU 优化。
 
 RKNN-Toolkit2 安装要求:
 - x86 Linux (Ubuntu 20.04/22.04)
@@ -8,22 +8,17 @@ RKNN-Toolkit2 安装要求:
 - pip install rknn-toolkit2
 
 用法 (在 Linux 构建机上):
-    python export/convert_rknn.py --onnx_dir ./exported --output_dir ./rknn_models
+    python deploy/convert_all.py --graph all --precision fp16
 """
-
-import os
 
 # ═══════════════════════════════════════════════════════
 # 通用 RKNN 配置
 # ═══════════════════════════════════════════════════════
 
 COMMON_CONFIG = {
-    "target_platform": "rk3588",
+    "target_platform": "rk3576",
     "optimization_level": 3,
-    "output_tensor_type": "float16",
-    "do_quantization": False,
-    "inputs_zp": {},
-    "outputs_zp": {},
+    "float_dtype": "float16",
 }
 
 # ═══════════════════════════════════════════════════════
@@ -33,19 +28,13 @@ COMMON_CONFIG = {
 TEMPORAL_BODY_CONFIG = {
     **COMMON_CONFIG,
     "model_name": "temporal_body",
-    "description": "12-layer Temporal Body (single-frame stateful)",
-    "onnx_file": "temporal_body.onnx",
+    "description": "12-layer Temporal Body (single-frame stateful, 27 inputs)",
+    "onnx_file": "temporal_body_sim.onnx",
     "rknn_file": "temporal_body.rknn",
-    # FP16 量化 (避免 INT8 精度损失)
-    "quantized_dtype": "float16",
-    # 大模型分段加载 (SRAM 32KB tiling)
-    "output_tensor_type": "float16",
-    # 输入归一化 (可选, 取决于训练数据分布)
-    "mean_values": None,
-    "std_values": None,
-    # KV cache 维度: [B, H, L, D] per layer
-    # 26 inputs (x + cond + 12 self_k + 12 self_v)
-    # 25 outputs (out + 12 self_k + 12 self_v)
+    # 27 inputs: x + cond + attn_mask + 12 self_k + 12 self_v
+    # 25 outputs: output + 12 self_k_out + 12 self_v_out
+    # KV cache: 42 positions (41 window + 1 sink), mask: 44 positions
+    # ~365MB FP16 weights
 }
 
 DEPTH_BODY_CONFIG = {
@@ -54,12 +43,8 @@ DEPTH_BODY_CONFIG = {
     "description": "2-layer Depth Body (RVQ AR)",
     "onnx_file": "depth_body.onnx",
     "rknn_file": "depth_body.rknn",
-    "quantized_dtype": "float16",
-    # 输入: [B, 12, 1024]
-    # 输出: [B, 12, 1030]
-    # 注意: FP16 可能溢出 (iPhone 移植经验: 15.7% NaN)
-    # 对策: 先用 FP16 验证, 如不行改用 FP32 CPU
-    "output_tensor_type": "float16",
+    # 输入: [B, 12, 1024], 输出: [B, 12, 12294]
+    # 注意: FP16 可能溢出 (token 嵌入放大), 如不行用 FP32
 }
 
 CODEC_DECODER_CONFIG = {
@@ -68,29 +53,7 @@ CODEC_DECODER_CONFIG = {
     "description": "SpectroStream ConvTranspose Decoder",
     "onnx_file": "codec_decoder.onnx",
     "rknn_file": "codec_decoder.rknn",
-    # 纯卷积 → INT8 量化安全
-    "quantized_dtype": "int8",
-    "quantized_method": "layer",
-    "quantized_algorithm": "mmse",  # 最小化均方误差
-    "output_tensor_type": "float16",
-    # Conv+ELU 融合加速
-    "optimization_level": 3,
-}
-
-# ═══════════════════════════════════════════════════════
-# INT8 量化配置 (校准数据集)
-# ═══════════════════════════════════════════════════════
-
-INT8_QUANT_CONFIG = {
-    "quantized_dtype": "int8",
-    "quantized_method": "layer",
-    "quantized_algorithm": "mmse",
-    "do_quantization": True,
-    "dataset": None,  # 需提供代表性校准数据集
-    # 校准图像/数据数量
-    "quant_img_num": 100,
-    # 批量大小
-    "batch_size": 1,
+    # 纯卷积 → INT8 量化可选
 }
 
 # ═══════════════════════════════════════════════════════

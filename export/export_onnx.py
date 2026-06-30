@@ -24,7 +24,7 @@ from models.depthformer import TemporalBodyStateful, DepthBodyAR
 from models.spectrostream import SpectroStreamDecoder
 
 
-def export_temporal_body(output_dir: str, max_kv_len: int = 512):
+def export_temporal_body(output_dir: str, max_kv_len: int = 512, model=None):
     """导出 Temporal Body 为单帧 stateful ONNX graph
 
     输入:
@@ -32,8 +32,6 @@ def export_temporal_body(output_dir: str, max_kv_len: int = 512):
       conditioning: [1, T_cond, 256]  MIDI encoder 输出 (预计算)
       self_k_cache: [1, 8, max_kv_len, 128]  每层 self-attn K cache
       self_v_cache: [1, 8, max_kv_len, 128]  每层 self-attn V cache
-      cross_k:      [1, 8, T_cond, 128]  每层 cross-attn K (预计算)
-      cross_v:      [1, 8, T_cond, 128]  每层 cross-attn V (预计算)
 
     输出:
       output:       [1, 1, 1024]
@@ -41,11 +39,15 @@ def export_temporal_body(output_dir: str, max_kv_len: int = 512):
       self_v_new:   [1, 8, max_kv_len, 128]  更新后的 V cache
 
     注意: cross_k/cross_v 不变 (conditioning 固定), 不作为输出
+
+    Args:
+        model: 可选的已有模型实例, 如果为 None 则创建新模型
     """
     print("\n[1/3] Exporting Temporal Body (single-frame stateful)...")
 
     cfg = DepthFormerConfig()
-    model = TemporalBodyStateful(cfg)
+    if model is None:
+        model = TemporalBodyStateful(cfg)
     model.eval()
 
     T_cond = 50  # 条件序列长度 (示例)
@@ -65,7 +67,7 @@ def export_temporal_body(output_dir: str, max_kv_len: int = 512):
         self_k_caches.append(torch.randn(1, num_heads, max_kv_len, dim_per_head))
         self_v_caches.append(torch.randn(1, num_heads, max_kv_len, dim_per_head))
 
-    # 构建带 KV cache 的推理
+    # 构建带 KV cache + attention mask 的推理
     class TemporalBodyExportWrapper(torch.nn.Module):
         def __init__(self, body, num_layers, max_len):
             super().__init__()
@@ -73,7 +75,7 @@ def export_temporal_body(output_dir: str, max_kv_len: int = 512):
             self.num_layers = num_layers
             self.max_len = max_len
 
-        def forward(self, x, cond, *kv_inputs):
+        def forward(self, x, cond, attn_mask, *kv_inputs):
             # kv_inputs: [self_k_0, self_v_0, self_k_1, self_v_1, ...]
             kv_caches = []
             for i in range(self.num_layers):
@@ -82,7 +84,7 @@ def export_temporal_body(output_dir: str, max_kv_len: int = 512):
                     "cross_kv": None,  # 从 conditioning 动态计算
                 })
 
-            output, new_caches = self.body(x, cond, kv_caches)
+            output, new_caches = self.body(x, cond, kv_caches, attention_mask=attn_mask)
 
             # 更新 self-attn KV cache (Concat + Slice to keep max_len)
             outputs = [output]
@@ -98,31 +100,30 @@ def export_temporal_body(output_dir: str, max_kv_len: int = 512):
 
     wrapper = TemporalBodyExportWrapper(model, num_layers, max_kv_len)
 
-    # 动态轴: kv cache 的时间维度可变
-    dynamic_axes = {"x": {0: "batch"}, "cond": {0: "batch"}}
-    input_names = ["x", "cond"]
+    # 固定形状, 无动态轴 (RKNN 要求)
+    input_names = ["x", "cond", "attn_mask"]
     for i in range(num_layers):
         input_names.append(f"self_k_{i}")
         input_names.append(f"self_v_{i}")
-        dynamic_axes[f"self_k_{i}"] = {0: "batch", 2: "kv_len"}
-        dynamic_axes[f"self_v_{i}"] = {0: "batch", 2: "kv_len"}
 
     output_names = ["output"]
     for i in range(num_layers):
         output_names.append(f"self_k_out_{i}")
         output_names.append(f"self_v_out_{i}")
-        dynamic_axes[f"self_k_out_{i}"] = {0: "batch", 2: "kv_len"}
-        dynamic_axes[f"self_v_out_{i}"] = {0: "batch", 2: "kv_len"}
 
-    # 构建完整输入
-    all_inputs = [x, cond] + self_k_caches + self_v_caches
+    # Attention mask: [1, 1, 1, max_kv_len + 1 + num_sinks]
+    # max_kv_len=42, sink=1, +1 for current frame → 44
+    mask_len = max_kv_len + 1 + cfg.num_attention_sink_embeddings
+    attn_mask = torch.zeros(1, 1, 1, mask_len)
+
+    # 构建完整输入: x, cond, attn_mask, + 24 KV cache tensors
+    all_inputs = [x, cond, attn_mask] + self_k_caches + self_v_caches
 
     path = os.path.join(output_dir, "temporal_body.onnx")
     torch.onnx.export(
         wrapper, tuple(all_inputs), path,
         input_names=input_names,
         output_names=output_names,
-        dynamic_axes=dynamic_axes,
         opset_version=17,
         do_constant_folding=True,
         dynamo=False,
@@ -131,9 +132,9 @@ def export_temporal_body(output_dir: str, max_kv_len: int = 512):
     params = sum(p.numel() for p in model.parameters())
     print(f"  → {path}")
     print(f"     Params: {params/1e6:.1f}M")
-    print(f"     Inputs:  {len(input_names)} ({', '.join(input_names[:4])} ...)")
+    print(f"     Inputs:  {len(input_names)} ({', '.join(input_names[:5])} ...)")
     print(f"     Outputs: {len(output_names)} ({', '.join(output_names[:4])} ...)")
-    print(f"     Max KV length: {max_kv_len}")
+    print(f"     KV cache: {max_kv_len} pos, mask: {mask_len} pos (fixed)")
 
 
 def export_depth_body(output_dir: str):
@@ -216,8 +217,8 @@ def main():
     parser = argparse.ArgumentParser(description="Export MRT2 models to ONNX")
     parser.add_argument("--output_dir", default="./exported",
                         help="Output directory for ONNX files")
-    parser.add_argument("--max_kv_len", type=int, default=512,
-                        help="Maximum KV cache length for temporal body")
+    parser.add_argument("--max_kv_len", type=int, default=42,
+                        help="Maximum KV cache length for temporal body (42 = 41 window + 1 sink)")
     parser.add_argument("--codec_T", type=int, default=25,
                         help="Number of input frames for codec decoder (25 = 1 second)")
     args = parser.parse_args()
