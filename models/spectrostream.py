@@ -146,9 +146,14 @@ class SpectroStreamDecoder(nn.Module):
       input_residual:  512 → 512  (bottleneck, stride=1)
       decoder_0:       512 → 512  (stride=(2,1))
       --- ParallelChannels(group=2) splits channels: 512→2×256 ---
-      decoder_1..6:    256→256→256→128→128→64  (per group)
-      output_layer:    64 → 2    (per group)
-      concat:          2+2 = 4   (final output channels)
+      decoder_1:       256 → 128  (stride=(2,2), mult=2)
+      decoder_2:       128 → 128  (stride=(1,2), mult=1)
+      decoder_3:       128 → 128  (stride=(1,2), mult=1)
+      decoder_4:       128 → 64   (stride=(1,3), mult=2)
+      decoder_5:        64 → 64   (stride=(1,2), mult=1)
+      decoder_6:        64 → 32   (stride=(1,2), mult=2)
+      output_layer:     32 → 2    (per group, kernel=7×7)
+      concat:           2+2 = 4   (final output channels)
     """
 
     def __init__(self, config: SpectroStreamConfig):
