@@ -73,14 +73,11 @@ class CodecDataset(Dataset):
         # 长度对齐
         if chunk.shape[1] < self.segment_samples:
             chunk = F.pad(chunk, (0, self.segment_samples - chunk.shape[1]))
-        # 随机增益增强 (±3dB)
+        # 随机增益增强 (±3dB, 在峰值归一化之前)
         if random.random() < 0.5:
-            gain = 10 ** (random.uniform(-3, 3) / 20.0)
-            chunk = chunk * gain
-        # 峰值归一化到 [-1, 1]
-        peak = chunk.abs().max()
-        if peak > 0:
-            chunk = chunk / peak
+            gain_db = random.uniform(-3, 3)
+            gain_linear = 10 ** (gain_db / 20.0)
+            chunk = chunk * gain_linear
         return chunk  # [channels, samples]
 
 

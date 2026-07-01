@@ -138,14 +138,8 @@ class SlidingWindowAttention(nn.Module):
         # q: [B, H, T, D], k: [B, H, T+L_sink, D]
         attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # [B, H, T, K]
 
-        # 因果遮罩
+        # 因果遮罩 (外部提供时优先使用, 否则内部构建滑动窗口)
         if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask
-
-        # 滑动窗口: 屏蔽超出 max_past_horizon 的过去位置
-        # 如果外部提供了 attention_mask, 跳过内部 mask 构建 (用于静态 ONNX 导出)
-        if attention_mask is not None:
-            # 外部 mask 已包含滑动窗口 + padding 逻辑, 直接使用
             attn_weights = attn_weights + attention_mask
         else:
             K = k.shape[2]
@@ -228,9 +222,8 @@ class CrossAttention(nn.Module):
         v = self._reshape(self.v_proj(conditioning))
 
         if kv_cache is not None:
-            k_cache, v_cache = kv_cache
-            k = torch.cat([k_cache, k], dim=2)
-            v = torch.cat([v_cache, v], dim=2)
+            # conditioning 是静态的, 使用缓存的 K/V, 不重复拼接
+            k, v = kv_cache
         new_kv_cache = (k, v)
 
         attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self.scale

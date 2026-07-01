@@ -216,6 +216,8 @@ def train():
     parser.add_argument('--save_interval', type=int, default=5)
     parser.add_argument('--phase1_epochs', type=int, default=50,
                         help='Epochs with decoder frozen (encoder-only training)')
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Resume from checkpoint path')
     args = parser.parse_args()
 
     # DDP setup
@@ -287,7 +289,22 @@ def train():
     scaler = torch.amp.GradScaler('cuda', enabled=(args.precision == 'fp16'))
 
     global_step = 0
-    for epoch in range(1, args.epochs + 1):
+    start_epoch = 1
+
+    # Resume from checkpoint
+    if args.resume:
+        if is_main: print(f"Resuming from {args.resume}")
+        ckpt = torch.load(args.resume, map_location='cpu', weights_only=True)
+        encoder.load_state_dict(ckpt['encoder'])
+        decoder.load_state_dict(ckpt['decoder'])
+        rvq.load_state_dict(ckpt['rvq'])
+        optimizer.load_state_dict(ckpt['optimizer'])
+        start_epoch = ckpt['epoch'] + 1
+        base_lr = ckpt.get('base_lr', args.lr)
+        global_step = ckpt.get('global_step', 0)
+        if is_main: print(f"  Resumed from epoch {ckpt['epoch']}, step {global_step}")
+
+    for epoch in range(start_epoch, args.epochs + 1):
         loader.sampler.set_epoch(epoch)
         encoder.train()
         if epoch > args.phase1_epochs:
@@ -328,6 +345,7 @@ def train():
             else:
                 progress = (global_step - warmup_steps) / (total_steps - warmup_steps)
                 lr_scale = 0.5 * (1 + math.cos(math.pi * progress))
+                lr_scale = max(lr_scale, 1e-6 / base_lr)  # floor at 1e-6
             for pg in optimizer.param_groups:
                 pg['lr'] = base_lr * lr_scale
 
@@ -397,10 +415,14 @@ def train():
                 ckpt_path = os.path.join(args.output_dir, f'codec_epoch{epoch}.pt')
                 torch.save({
                     'epoch': epoch,
-                    'encoder': encoder.state_dict(),
-                    'decoder': decoder.state_dict(),
+                    'encoder': (encoder.module if world_size > 1 else encoder).state_dict(),
+                    'decoder': (decoder.module if world_size > 1 and epoch > args.phase1_epochs
+                                else decoder.state_dict() if epoch <= args.phase1_epochs
+                                else decoder.module.state_dict()),
                     'rvq': rvq.state_dict(),
                     'optimizer': optimizer.state_dict(),
+                    'base_lr': base_lr,
+                    'global_step': global_step,
                     'cfg': cfg,
                 }, ckpt_path)
                 print(f"  Saved: {ckpt_path}")

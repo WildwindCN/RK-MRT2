@@ -233,8 +233,15 @@ class DepthBodyAR(nn.Module):
         """
         x = self.input_adapter(x)
 
+        # 因果遮罩: RVQ 层级联自回归, 每层只能看到当前及之前的 RVQ 层
+        Q = x.shape[1]
+        causal_mask = torch.triu(
+            torch.ones(Q, Q, device=x.device, dtype=x.dtype) * float('-inf'),
+            diagonal=1,
+        ).unsqueeze(0).unsqueeze(0)  # [1, 1, Q, Q]
+
         for layer in self.layers:
-            x, _, _ = layer(x, conditioning=None)
+            x, _, _ = layer(x, conditioning=None, attention_mask=causal_mask)
 
         x = self.final_norm(x)
 
