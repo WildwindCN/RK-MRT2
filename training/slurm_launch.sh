@@ -9,8 +9,10 @@
 #SBATCH --output=logs/codec_%j.out
 #SBATCH --error=logs/codec_%j.err
 
-# SpectroStream Codec 训练 — 8×A100 80GB 最大吞吐量配置
-# 46M 参数 DDP, bf16, 预计 20-30h
+# SpectroStream Codec 训练 — 8×A100 80GB, 120s segments
+# 1000h ≈ 30,000 segments, batch=96 → 312 steps/epoch
+# 预计: Phase1 ~21min/epoch, Phase2 ~36min/epoch
+# 48h → ~100 epochs (Phase1: 50, Phase2: ~50)
 
 set -e
 
@@ -33,10 +35,11 @@ CHECKPOINT_DIR="./checkpoints"
 mkdir -p "$CHECKPOINT_DIR" logs
 
 echo "============================================"
-echo "SpectroStream Codec Training (8×A100 80GB)"
-echo "  Model: 46M trainable params, DDP bf16"
+echo "SpectroStream Codec Training (8×A100 80GB, 120s segments)"
+echo "  Model: 46M trainable, DDP bf16"
 echo "  GPUs:  $SLURM_GPUS_PER_NODE × 80GB"
-echo "  Batch: 24/GPU × 8 = 192 effective"
+echo "  Batch: 12/GPU × 8 = 96 effective"
+echo "  Segment: 120s (5.76M samples)"
 echo "  Data:  $DATA_DIR"
 echo "============================================"
 
@@ -49,11 +52,11 @@ torchrun \
     --data_dir "$DATA_DIR" \
     --output_dir "$CHECKPOINT_DIR" \
     --epochs 200 \
-    --batch_size 24 \
+    --batch_size 12 \
     --lr 3e-4 \
     --precision bf16 \
-    --num_workers 6 \
-    --prefetch_factor 4 \
-    --segment_seconds 10.0
+    --num_workers 4 \
+    --prefetch_factor 2 \
+    --segment_seconds 120.0
 
 echo "Training complete."

@@ -208,7 +208,7 @@ def train():
     parser.add_argument('--epochs', type=int, default=200)
     parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--lr', type=float, default=3e-4)
-    parser.add_argument('--segment_seconds', type=float, default=10.0)
+    parser.add_argument('--segment_seconds', type=float, default=120.0)
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--prefetch_factor', type=int, default=2)
     parser.add_argument('--precision', type=str, default='bf16',
