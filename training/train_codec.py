@@ -52,7 +52,7 @@ def load_checkpoint_state(path, cfg, encoder, decoder):
       (根据 channel_splits 配置自动分配)
     Encoder 不加载 (从头训练), RVQ 加载后冻结。
     """
-    state = torch.load(path, map_location='cpu', weights_only=True)
+    state = torch.load(path, map_location='cpu', weights_only=False)
     codec_state = state['codec_decoder']
 
     # Load RVQ
