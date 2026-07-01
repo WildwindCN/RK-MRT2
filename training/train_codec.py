@@ -210,6 +210,7 @@ def train():
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--segment_seconds', type=float, default=10.0)
     parser.add_argument('--num_workers', type=int, default=4)
+    parser.add_argument('--prefetch_factor', type=int, default=2)
     parser.add_argument('--precision', type=str, default='bf16',
                         choices=['fp32', 'fp16', 'bf16'])
     parser.add_argument('--log_interval', type=int, default=100)
@@ -229,19 +230,24 @@ def train():
         os.makedirs(args.output_dir, exist_ok=True)
         writer = SummaryWriter(os.path.join(args.output_dir, 'logs'))
         print("=" * 60)
-        print("SpectroStream Codec Training")
+        print("SpectroStream Codec Training (DDP, max throughput)")
         print(f"  Data: {args.data_dir}")
         print(f"  GPUs: {world_size}, Batch/GPU: {args.batch_size}")
-        print(f"  Total batch: {world_size * args.batch_size}")
+        print(f"  Effective batch: {world_size * args.batch_size}")
         print(f"  Epochs: {args.epochs}, LR: {args.lr}")
         print(f"  Precision: {args.precision}")
         print("=" * 60)
 
+    # Speed optimizations for A100
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+
     # Config & Models
     cfg = SpectroStreamConfig()
 
-    encoder = SpectroStreamEncoder(cfg).to(device)
-    decoder = SpectroStreamDecoder(cfg).to(device)
+    encoder = SpectroStreamEncoder(cfg).to(device, memory_format=torch.channels_last)
+    decoder = SpectroStreamDecoder(cfg).to(device, memory_format=torch.channels_last)
 
     # Load RVQ (frozen) + Decoder init from checkpoint
     rvq = load_checkpoint_state(args.checkpoint, cfg, encoder, decoder)
@@ -270,7 +276,8 @@ def train():
     # Optimizer
     base_lr = args.lr
     optimizer = torch.optim.AdamW(trainable_params, lr=base_lr,
-                                   betas=(0.8, 0.99), weight_decay=1e-5)
+                                   betas=(0.8, 0.99), weight_decay=1e-5,
+                                   foreach=True)  # fused update for speed
 
     # Data
     loader, dataset = create_dataloader(
@@ -278,10 +285,11 @@ def train():
         num_workers=args.num_workers,
         segment_seconds=args.segment_seconds,
         ddp=True, rank=rank, world_size=world_size,
+        prefetch_factor=args.prefetch_factor,
     )
 
     total_steps = len(loader) * args.epochs
-    warmup_steps = min(5000, total_steps // 10)
+    warmup_steps = min(int(5000 * 64 / (world_size * args.batch_size)), total_steps // 10)  # scale with effective batch
 
     # AMP scaler
     use_amp = args.precision in ('fp16', 'bf16')
@@ -325,7 +333,8 @@ def train():
                                list(decoder.parameters()))
             base_lr = args.lr * 0.5  # Reduce LR for joint fine-tuning
             optimizer = torch.optim.AdamW(trainable_params, lr=base_lr,
-                                           betas=(0.8, 0.99), weight_decay=1e-5)
+                                           betas=(0.8, 0.99), weight_decay=1e-5,
+                                           foreach=True)
             # Wrap decoder in DDP now that it's trainable
             if world_size > 1:
                 decoder = DDP(decoder, device_ids=[local_rank],

@@ -83,7 +83,8 @@ class CodecDataset(Dataset):
 
 def create_dataloader(data_dir: str, batch_size: int = 8, num_workers: int = 4,
                       segment_seconds: float = 10.0, sample_rate: int = 48000,
-                      ddp: bool = False, rank: int = 0, world_size: int = 1):
+                      ddp: bool = False, rank: int = 0, world_size: int = 1,
+                      prefetch_factor: int = 2):
     """创建训练 DataLoader
 
     Args:
@@ -95,6 +96,7 @@ def create_dataloader(data_dir: str, batch_size: int = 8, num_workers: int = 4,
         ddp: 是否使用 DistributedSampler
         rank: 当前进程 rank
         world_size: 总进程数
+        prefetch_factor: 每个 worker 预取 batch 数
     """
     segment_samples = int(segment_seconds * sample_rate)
     dataset = CodecDataset(data_dir, segment_samples=segment_samples,
@@ -108,5 +110,7 @@ def create_dataloader(data_dir: str, batch_size: int = 8, num_workers: int = 4,
                         shuffle=(sampler is None),
                         num_workers=num_workers,
                         pin_memory=True,
+                        persistent_workers=(num_workers > 0),
+                        prefetch_factor=prefetch_factor if num_workers > 0 else None,
                         drop_last=True)
     return loader, dataset
