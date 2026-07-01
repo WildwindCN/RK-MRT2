@@ -9,24 +9,26 @@
 #SBATCH --output=logs/codec_%j.out
 #SBATCH --error=logs/codec_%j.err
 
-# SpectroStream Codec 训练 — 8×A100 80GB, 120s segments
-# 1000h ≈ 30,000 segments, batch=96 → 312 steps/epoch
-# 预计: Phase1 ~21min/epoch, Phase2 ~36min/epoch
-# 48h → ~100 epochs (Phase1: 50, Phase2: ~50)
+# SpectroStream Codec 训练 — 8×A800 80GB, max GPU utilization
+# 每样本 ~2.5GB 激活 (120s bf16), batch=20 → ~50GB/GPU
+# 1000h ≈ 30,000 segments, batch=160 → 188 steps/epoch
+# Phase1 ~15min/epoch, Phase2 ~25min/epoch
+# 48h → ~135 epochs
 
 set -e
 
-# --- NCCL 性能调优 (8×A100 NVLink) ---
+# --- GPU 性能锁定 (A800 300W TDP) ---
+nvidia-smi -pm 1 2>/dev/null || true
+nvidia-smi -ac 1215,1410 2>/dev/null || true
+
+# --- NCCL (8×A800 NVSwitch) ---
 export NCCL_DEBUG=WARN
-export NCCL_ALGO=Ring
+export NCCL_ALGO=Tree
 export NCCL_NSOCKS_PERTHREAD=4
 export NCCL_SOCKET_NTHREADS=2
-export NCCL_BUFFSIZE=2097152
-export NCCL_IB_DISABLE=0
-export NCCL_NET_GDR_LEVEL=2
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
-# --- CPU/IO 优化 ---
+# --- CPU/IO ---
 export OMP_NUM_THREADS=8
 export PYTHONUNBUFFERED=1
 
@@ -35,11 +37,9 @@ CHECKPOINT_DIR="./checkpoints"
 mkdir -p "$CHECKPOINT_DIR" logs
 
 echo "============================================"
-echo "SpectroStream Codec Training (8×A100 80GB, 120s segments)"
-echo "  Model: 46M trainable, DDP bf16"
-echo "  GPUs:  $SLURM_GPUS_PER_NODE × 80GB"
-echo "  Batch: 12/GPU × 8 = 96 effective"
-echo "  Segment: 120s (5.76M samples)"
+echo "SpectroStream Codec (8×A800 80GB, max util)"
+echo "  Batch: 20/GPU × 8 = 160 effective"
+echo "  VRAM: ~50GB/GPU (80% of 80GB)"
 echo "  Data:  $DATA_DIR"
 echo "============================================"
 
@@ -52,7 +52,7 @@ torchrun \
     --data_dir "$DATA_DIR" \
     --output_dir "$CHECKPOINT_DIR" \
     --epochs 200 \
-    --batch_size 12 \
+    --batch_size 20 \
     --lr 3e-4 \
     --precision bf16 \
     --num_workers 4 \
