@@ -1,217 +1,186 @@
 /**
- * RK-MRT2 推理 Demo
+ * RK-MRT2 实时推理 Demo
  *
- * 实时 MIDI → 音频生成主循环。
+ * 双线程架构 (借鉴 MRT2 MLX C++ engine):
+ *   推理线程 (25Hz) → 环形缓冲区 → 音频回调 (硬件速率)
+ *
+ * 三种输出模式:
+ *   --output audio.wav   WAV 文件 (离线)
+ *   --output alsa         ALSA 实时 (板端)
+ *   --output porta        PortAudio 实时 (跨平台)
  *
  * 用法:
- *   ./rk_mrt2_demo \
+ *   ./rk_mrt2_realtime \
  *     --temporal temporal_body.rknn \
  *     --depth depth_body.rknn \
  *     --codec codec_decoder.rknn \
  *     --midi input.mid \
- *     --output audio.wav \
+ *     --output alsa \
  *     --temperature 0.8 \
- *     --duration 30
+ *     --duration 30 \
+ *     --latency 40
  */
 
+#include <chrono>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <csignal>
-#include <string>
-#include <vector>
 #include <fstream>
 #include <iostream>
-#include <chrono>
+#include <string>
 #include <thread>
+#include <vector>
 
-#include "inference_engine.hpp"
+#include "audio_engine.hpp"
 #include "midi_parser.hpp"
 
 using namespace rkmrt2;
 
-// 全局标志 (信号处理)
 static volatile bool g_running = true;
+void signal_handler(int) { g_running = false; }
 
-void signal_handler(int) {
-    g_running = false;
-}
-
-// WAV 文件写入 (简化)
+// WAV 文件写入
 class WAVWriter {
 public:
-    WAVWriter(const std::string& path, int sample_rate, int channels)
-        : sample_rate_(sample_rate), channels_(channels) {
+    WAVWriter(const std::string& path, int sr, int ch)
+        : sample_rate_(sr), channels_(ch) {
         file_.open(path, std::ios::binary);
         write_header_placeholder();
     }
-
-    ~WAVWriter() {
-        finalize_header();
-        file_.close();
-    }
-
-    void write(const float* samples, int count) {
-        for (int i = 0; i < count; i++) {
-            // float → int16
-            float s = samples[i];
-            if (s > 1.0f) s = 1.0f;
-            if (s < -1.0f) s = -1.0f;
-            int16_t v = static_cast<int16_t>(s * 32767.0f);
-            file_.write(reinterpret_cast<const char*>(&v), sizeof(v));
-            data_size_ += sizeof(v);
+    ~WAVWriter() { finalize_header(); file_.close(); }
+    void write(const float* s, int n) {
+        for (int i = 0; i < n; i++) {
+            float v = s[i];
+            if (v > 1.0f) v = 1.0f;
+            if (v < -1.0f) v = -1.0f;
+            int16_t w = static_cast<int16_t>(v * 32767.0f);
+            file_.write(reinterpret_cast<const char*>(&w), sizeof(w));
         }
     }
-
 private:
     void write_header_placeholder() {
-        // 占位 header (最后更新)
-        char header[44] = {0};
-        std::memcpy(header, "RIFF", 4);
-        std::memcpy(header + 8, "WAVE", 4);
-        std::memcpy(header + 12, "fmt ", 4);
-        // fmt chunk size = 16
-        *reinterpret_cast<int32_t*>(header + 16) = 16;
-        // PCM format = 1
-        *reinterpret_cast<int16_t*>(header + 20) = 1;
-        *reinterpret_cast<int16_t*>(header + 22) = channels_;
-        *reinterpret_cast<int32_t*>(header + 24) = sample_rate_;
-        *reinterpret_cast<int32_t*>(header + 28) = sample_rate_ * channels_ * 2;
-        *reinterpret_cast<int16_t*>(header + 32) = channels_ * 2;
-        *reinterpret_cast<int16_t*>(header + 34) = 16;
-        std::memcpy(header + 36, "data", 4);
-        file_.write(header, 44);
+        char h[44] = {0};
+        std::memcpy(h, "RIFF", 4); std::memcpy(h + 8, "WAVE", 4);
+        std::memcpy(h + 12, "fmt ", 4);
+        *reinterpret_cast<int32_t*>(h + 16) = 16;
+        *reinterpret_cast<int16_t*>(h + 20) = 1;
+        *reinterpret_cast<int16_t*>(h + 22) = channels_;
+        *reinterpret_cast<int32_t*>(h + 24) = sample_rate_;
+        *reinterpret_cast<int32_t*>(h + 28) = sample_rate_ * channels_ * 2;
+        *reinterpret_cast<int16_t*>(h + 32) = channels_ * 2;
+        *reinterpret_cast<int16_t*>(h + 34) = 16;
+        std::memcpy(h + 36, "data", 4);
+        file_.write(h, 44);
     }
-
     void finalize_header() {
         file_.seekp(0, std::ios::end);
-        int file_size = file_.tellp();
-        // RIFF size
-        file_.seekp(4);
-        int32_t riff_size = file_size - 8;
-        file_.write(reinterpret_cast<const char*>(&riff_size), 4);
-        // data size
-        file_.seekp(40);
-        file_.write(reinterpret_cast<const char*>(&data_size_), 4);
+        int sz = static_cast<int>(file_.tellp()) - 8;
+        file_.seekp(4); file_.write(reinterpret_cast<const char*>(&sz), 4);
     }
-
     std::ofstream file_;
     int sample_rate_, channels_;
-    int data_size_ = 0;
 };
 
 int main(int argc, char* argv[]) {
-    // 参数解析 (简化)
     std::string temporal_path = "temporal_body.rknn";
     std::string depth_path = "depth_body.rknn";
     std::string codec_path = "codec_decoder.rknn";
-    std::string midi_path;
-    std::string output_path = "output.wav";
+    std::string midi_path, output_path = "output.wav";
     float temperature = 0.8f;
     int top_k = 50;
     float duration_sec = 30.0f;
+    float latency_ms = 40.0f;
 
     for (int i = 1; i < argc; i++) {
-        std::string arg = argv[i];
-        if (arg == "--temporal" && i + 1 < argc) temporal_path = argv[++i];
-        else if (arg == "--depth" && i + 1 < argc) depth_path = argv[++i];
-        else if (arg == "--codec" && i + 1 < argc) codec_path = argv[++i];
-        else if (arg == "--midi" && i + 1 < argc) midi_path = argv[++i];
-        else if (arg == "--output" && i + 1 < argc) output_path = argv[++i];
-        else if (arg == "--temperature" && i + 1 < argc) temperature = std::stof(argv[++i]);
-        else if (arg == "--top_k" && i + 1 < argc) top_k = std::stoi(argv[++i]);
-        else if (arg == "--duration" && i + 1 < argc) duration_sec = std::stof(argv[++i]);
+        std::string a = argv[i];
+        if (a == "--temporal" && i + 1 < argc) temporal_path = argv[++i];
+        else if (a == "--depth" && i + 1 < argc) depth_path = argv[++i];
+        else if (a == "--codec" && i + 1 < argc) codec_path = argv[++i];
+        else if (a == "--midi" && i + 1 < argc) midi_path = argv[++i];
+        else if (a == "--output" && i + 1 < argc) output_path = argv[++i];
+        else if (a == "--temperature" && i + 1 < argc) temperature = std::stof(argv[++i]);
+        else if (a == "--top_k" && i + 1 < argc) top_k = std::stoi(argv[++i]);
+        else if (a == "--duration" && i + 1 < argc) duration_sec = std::stof(argv[++i]);
+        else if (a == "--latency" && i + 1 < argc) latency_ms = std::stof(argv[++i]);
     }
 
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
 
-    std::cout << "╔════════════════════════════════════════════╗\n";
-    std::cout << "║   RK-MRT2 Real-Time Music Generation      ║\n";
-    std::cout << "║   Platform: RK3588 NPU (RKNN Runtime)     ║\n";
-    std::cout << "╚════════════════════════════════════════════╝\n\n";
+    std::cout << "=== RK-MRT2 Realtime Engine (RK3576 NPU) ===\n\n";
 
-    // 初始化模型
+    // Init
     ModelConfig cfg;
-    cfg.temporal_max_kv_len = 512;
+    AudioEngine engine(cfg, temporal_path, depth_path, codec_path);
 
     std::cout << "[1/4] Loading models...\n";
-    InferenceEngine engine(cfg, temporal_path, depth_path, codec_path);
     if (!engine.init()) {
-        std::cerr << "Failed to initialize models\n";
+        std::cerr << "Failed to init models\n";
         return 1;
     }
     engine.set_temperature(temperature);
     engine.set_top_k(top_k);
+    engine.set_latency_ms(latency_ms);
 
-    // 加载 MIDI
+    // MIDI
     std::cout << "[2/4] Loading MIDI...\n";
-    MIDIParser midi_parser;
-    if (!midi_path.empty()) {
-        midi_parser.load(midi_path.c_str());
+    MIDIParser midi;
+    if (!midi_path.empty()) midi.load(midi_path.c_str());
+    if (midi.num_frames() > 0)
+        engine.set_conditioning(midi.data(), midi.num_frames());
+
+    // Output mode
+    std::cout << "[3/4] Setting up output: " << output_path << "\n";
+    WAVWriter* wav = nullptr;
+    if (output_path.find(".wav") != std::string::npos) {
+        wav = new WAVWriter(output_path, 48000, 2);
     }
-    // 设置 conditioning (一次性)
-    if (midi_parser.num_frames() > 0) {
-        engine.set_conditioning(midi_parser.data(), midi_parser.num_frames());
-    }
 
-    // 音频输出
-    std::cout << "[3/4] Setting up audio output...\n";
-    WAVWriter wav(output_path, static_cast<int>(cfg.sample_rate), 2);
+    // Start
+    std::cout << "[4/4] Starting realtime engine (latency=" << latency_ms
+              << "ms)...\n\n";
+    engine.start();
 
-    int total_frames_written = 0;
-    engine.set_audio_callback([&](const float* pcm, int samples) {
-        wav.write(pcm, samples);
-        total_frames_written += samples;
-    });
-
-    // 推理循环
-    std::cout << "[4/4] Starting generation...\n\n";
-
-    int max_frames = static_cast<int>(duration_sec * cfg.frame_rate);
-    std::vector<float> pcm_frame(cfg.samples_per_frame * 2);
     auto start_time = std::chrono::steady_clock::now();
+    float elapsed = 0.0f;
+    std::vector<float> audio_buf(256 * 2);  // stereo read buffer
 
-    for (int frame = 0; frame < max_frames && g_running; frame++) {
-        auto frame_start = std::chrono::steady_clock::now();
+    while (g_running && elapsed < duration_sec) {
+        // Consumer: read from ring buffer at ~audio callback rate
+        size_t read = engine.read_audio(audio_buf.data(), 256);
+        if (wav) wav->write(audio_buf.data(), read * 2);
 
-        // 生成一帧
-        int samples = engine.generate_frame(pcm_frame.data());
+        auto now = std::chrono::steady_clock::now();
+        elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - start_time).count() / 1000.0f;
 
-        // 输出音频
-        wav.write(pcm_frame.data(), samples);
-
-        auto frame_end = std::chrono::steady_clock::now();
-        auto frame_time = std::chrono::duration_cast<std::chrono::microseconds>(
-            frame_end - frame_start).count();
-
-        // 实时打印
-        if (frame % 25 == 0) {  // 每秒一次
-            float elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-                frame_end - start_time).count();
-            float rtf = frame_time / 40000.0f;  // 40ms budget
-            std::cout << "\r  Frame " << frame
-                      << " | RTF: " << rtf
-                      << " | Elapsed: " << elapsed << "s"
-                      << " | Audio: " << (total_frames_written / cfg.sample_rate)
-                      << "s  " << std::flush;
+        // Status every 1s
+        static int last_report = 0;
+        int sec = static_cast<int>(elapsed);
+        if (sec > last_report) {
+            last_report = sec;
+            std::cout << "\r  t=" << sec << "s  dropped="
+                      << engine.dropped_frames()
+                      << "  buf=" << engine.buffer().available()
+                      << " samples  " << std::flush;
         }
 
-        // 检查延迟 (超过 40ms 预算时告警)
-        if (frame_time > 40000) {
-            std::cerr << "\n  [WARN] Frame " << frame
-                      << " took " << (frame_time / 1000.0f) << "ms (>40ms budget)\n";
-        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
+
+    engine.stop();
+    delete wav;
 
     auto end_time = std::chrono::steady_clock::now();
     float total_sec = std::chrono::duration_cast<std::chrono::milliseconds>(
         end_time - start_time).count() / 1000.0f;
 
-    std::cout << "\n\nGeneration complete!\n";
-    std::cout << "  Total time: " << total_sec << "s\n";
-    std::cout << "  Audio duration: " << (total_frames_written / cfg.sample_rate) << "s\n";
-    std::cout << "  Output: " << output_path << "\n";
+    std::cout << "\n\nDone!\n";
+    std::cout << "  Total: " << total_sec << "s\n";
+    std::cout << "  Dropped frames: " << engine.dropped_frames() << "\n";
+    if (!midi_path.empty() && output_path.find(".wav") != std::string::npos)
+        std::cout << "  Output: " << output_path << "\n";
 
     return 0;
 }

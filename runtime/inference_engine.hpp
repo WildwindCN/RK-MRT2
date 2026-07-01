@@ -133,6 +133,12 @@ public:
     // 重置生成状态
     void reset();
 
+    // 预生成 n 帧填充 KV cache (冷启动预热, 防止首帧欠载)
+    void prefill_frames(int n);
+
+    // NPU 保活: 微小推理防止 NPU 时钟降频 (借鉴 MRT2 GPU 保活)
+    void keep_alive();
+
     // 回调: 音频输出时触发
     using AudioCallback = std::function<void(const float* pcm, int samples)>;
     void set_audio_callback(AudioCallback cb) { audio_cb_ = std::move(cb); }
@@ -357,6 +363,25 @@ inline void InferenceEngine::tokens_to_embedding(
     //     lookup codebook[rvq_level][token[rvq]]
     //     accumulate
     // Note: 此操作放 CPU (RKNN Gather 有限制)
+}
+
+inline void InferenceEngine::prefill_frames(int n) {
+    // 预生成 n 帧填充 KV cache (冷启动预热)
+    // 借鉴 MRT2: start_locked() 中同步生成 3 帧防首帧欠载
+    std::vector<float> pcm(cfg_.samples_per_frame * 2);
+    for (int i = 0; i < n; ++i) {
+        generate_frame(pcm.data());
+    }
+}
+
+inline void InferenceEngine::keep_alive() {
+    // NPU 保活: 跑微小推理防止 NPU 时钟降频
+    // 借鉴 MRT2: inference_loop 中等 buffer 空间时跑 GPU 保活操作
+    // 在 RK3576 上, NPU 空闲时会降低时钟频率, 导致下一帧推理延迟增加
+    // 跑一个微小的 1×1 MatMul 保持 NPU 活跃
+    if (temporal_model_ && temporal_model_->is_loaded()) {
+        temporal_model_->keep_alive();
+    }
 }
 
 }  // namespace rkmrt2

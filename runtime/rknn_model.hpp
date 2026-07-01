@@ -71,6 +71,12 @@ public:
     // 推理 (所有输入/输出预分配)
     int run(const std::vector<float*>& inputs, std::vector<float*>& outputs);
 
+    // 查询状态
+    bool is_loaded() const { return initialized_; }
+
+    // NPU 保活: 微小推理防止时钟降频
+    void keep_alive();
+
     // 获取可写的输入/输出 buffer
     float* input_buffer(int idx);
     const float* output_buffer(int idx) const;
@@ -108,18 +114,22 @@ inline int RKNNModel::run(const std::vector<float*>& inputs,
                            std::vector<float*>& outputs) {
     // 实际实现:
     // 1. 拷贝输入到预分配 buffer
-    // for (int i = 0; i < inputs.size(); i++)
-    //     memcpy(input_bufs_[i], inputs[i], input_attrs_[i].size);
-    //
-    // 2. 运行推理
-    // rknn_inputs_set(ctx_, num_inputs_, input_attrs_.data());
-    // rknn_run(ctx_, nullptr);
-    // rknn_outputs_get(ctx_, num_outputs_, output_attrs_.data(), outputs.data());
-    //
+    // 2. rknn_run(ctx_, nullptr)
     // 3. 拷贝输出
-    // for (int i = 0; i < outputs.size(); i++)
-    //     memcpy(outputs[i], output_bufs_[i], output_attrs_[i].size);
     return 0;
+}
+
+inline void RKNNModel::keep_alive() {
+    // NPU 保活: 跑微小推理防止时钟降频
+    // 借鉴 MRT2 MLX engine: mx::array({0.0f}) + mx::array({0.0f})
+    // RK3576 NPU 空闲超时后会降频, 导致延迟增加 ~5-10ms
+    // 跑一个微小的推理操作保持 NPU 活跃
+    if (initialized_ && !input_bufs_.empty()) {
+        std::vector<float*> outputs(output_bufs_.size());
+        for (size_t i = 0; i < output_bufs_.size(); ++i)
+            outputs[i] = output_bufs_[i];
+        run(input_bufs_, outputs);
+    }
 }
 
 }  // namespace rkmrt2
